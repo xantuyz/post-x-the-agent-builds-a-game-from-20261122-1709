@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coin Catch — tangkap koin, hindari bom</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0b1026; overflow: hidden;
+    font-family: "DejaVu Sans", Arial, sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+
+// Coin Catch — satu file, tanpa dependensi.
+// Keranjang bergerak (mouse / sentuhan / panah kiri-kanan), koin jatuh
+// ditangkap = skor, bom jatuh harus dihindari. Tiap 10 poin, level naik
+// dan semuanya jatuh lebih cepat.
+//
+// Mode demo: buka dengan ?demo=1 — keranjang bergerak sendiri mengejar
+// koin terdekat (dan menghindar dari bom), RNG memakai seed tetap sehingga
+// demo yang sama selalu menghasilkan permainan yang sama.
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = 1080, H = 1920;
+
+const params = new URLSearchParams(location.search);
+const DEMO = params.get("demo") === "1";
+
+// RNG seed tetap untuk demo yang deterministik.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = DEMO ? mulberry32(20261123) : Math.random;
+
+// ---- state ----
+const basket = { x: W / 2, y: H - 260, w: 240, h: 110, speed: 1150 };
+let items = [];          // {kind:'coin'|'bomb', x, y, r, vy, rot, spin}
+let score = 0;
+let level = 1;
+let lives = 3;
+let spawnTimer = 0;
+let elapsed = 0;
+let started = DEMO;      // demo langsung jalan; mode biasa menunggu klik
+let over = false;
+let flash = 0;           // 0..1, kilat merah saat bom kena
+let keys = {};
+let pointerX = null;
+
+function fallSpeed() {
+  // Kecepatan dasar + naik tiap level (tiap 10 poin).
+  return 340 + (level - 1) * 95;
+}
+
+function spawnItem() {
+  const bombChance = Math.min(0.16 + level * 0.02, 0.34);
+  const kind = rand() < bombChance ? "bomb" : "coin";
+  const r = kind === "coin" ? 52 : 58;
+  items.push({
+    kind,
+    x: 70 + rand() * (W - 140),
+    y: -90,
+    r,
+    vy: fallSpeed() * (0.85 + rand() * 0.4),
+    rot: rand() * Math.PI * 2,
+    spin: (rand() - 0.5) * 3,
+  });
+}
+
+function reset() {
+  items = [];
+  score = 0; level = 1; lives = 3;
+  spawnTimer = 0; elapsed = 0;
+  over = false; flash = 0;
+  basket.x = W / 2;
+}
+
+function levelUpCheck() {
+  const newLevel = Math.floor(score / 10) + 1;
+  if (newLevel !== level) level = newLevel;
+}
+
+// ---- input ----
+canvas.addEventListener("pointermove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  pointerX = ((e.clientX - rect.left) / rect.width) * W;
+  if (!started) started = true;
+});
+canvas.addEventListener("pointerdown", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  pointerX = ((e.clientX - rect.left) / rect.left) * 0 + ((e.clientX - rect.left) / rect.width) * W;
+  if (over) { reset(); return; }
+  started = true;
+});
+window.addEventListener("keydown", (e) => {
+  keys[e.key] = true;
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") started = true;
+  if (over && (e.key === "Enter" || e.key === " ")) reset();
+});
+window.addEventListener("keyup", (e) => { keys[e.key] = false; });
+
+// ---- demo autopilot ----
+// Kejar koin terdekat; kalau ada bom tepat di atas keranjang, geser menjauh.
+function demoDrive(dt) {
+  let target = null;
+  let nearestY = Infinity;
+  for (const it of items) {
+    if (it.kind === "coin" && it.y < basket.y && it.y > -50 && it.y < nearestY) {
+      nearestY = it.y; target = it;
+    }
+  }
+  let want = target ? target.x : W / 2;
+  for (const it of items) {
+    if (it.kind === "bomb" && it.y > basket.y - 520 && it.y < basket.y) {
+      const dx = basket.x - it.x;
+      if (Math.abs(dx) < 190) want = it.x + (dx >= 0 ? 260 : -260);
+    }
+  }
+  want = Math.max(basket.w / 2 + 10, Math.min(W - basket.w / 2 - 10, want));
+  const diff = want - basket.x;
+  const step = basket.speed * 1.15 * dt;
+  basket.x += Math.abs(diff) <= step ? diff : Math.sign(diff) * step;
+}
+
+// ---- update ----
+function update(dt) {
+  if (!started || over) return;
+  elapsed += dt;
+
+  // Gerakan keranjang.
+  if (DEMO) {
+    demoDrive(dt);
+  } else {
+    if (pointerX !== null) {
+      const diff = pointerX - basket.x;
+      const step = basket.speed * 1.6 * dt;
+      basket.x += Math.abs(diff) <= step ? diff : Math.sign(diff) * step;
+    }
+    if (keys["ArrowLeft"]) basket.x -= basket.speed * dt;
+    if (keys["ArrowRight"]) basket.x += basket.speed * dt;
+    basket.x = Math.max(basket.w / 2 + 8, Math.min(W - basket.w / 2 - 8, basket.x));
+  }
+  basket.x = Math.max(basket.w / 2 + 8, Math.min(W - basket.w / 2 - 8, basket.x));
+
+  // Spawn: makin sering seiring level.
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnItem();
+    spawnTimer = Math.max(0.34, 0.85 - level * 0.06) * (0.7 + rand() * 0.6);
+  }
+
+  // Jatuhkan item, cek tangkapan.
+  const top = basket.y - basket.h / 2;
+  const bottom = basket.y + basket.h / 2;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += it.vy * dt;
+    it.rot += it.spin * dt;
+    const caught = it.y + it.r * 0.5 >= top && it.y - it.r * 0.5 <= bottom &&
+      Math.abs(it.x - basket.x) <= basket.w / 2 + it.r * 0.45;
+    if (caught) {
+      if (it.kind === "coin") {
+        score += 1;
+        levelUpCheck();
+      } else {
+        lives -= 1;
+        flash = 1;
+        if (lives <= 0) over = true;
+      }
+      items.splice(i, 1);
+      continue;
+    }
+    if (it.y - it.r > H) items.splice(i, 1);
+  }
+  if (flash > 0) flash = Math.max(0, flash - dt * 2.2);
+}
+
+// ---- gambar ----
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#101736");
+  g.addColorStop(0.55, "#0b1026");
+  g.addColorStop(1, "#1a0f33");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // Bintang-bintang kecil.
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  for (let i = 0; i < 70; i++) {
+    const sx = (i * 173) % W;
+    const sy = (i * 311) % 900;
+    ctx.globalAlpha = 0.25 + ((i * 37) % 10) / 22;
+    ctx.fillRect(sx, sy, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawCoin(it) {
+  ctx.save();
+  ctx.translate(it.x, it.y);
+  ctx.rotate(Math.sin(it.rot) * 0.25);
+  ctx.fillStyle = "#f5b301";
+  ctx.beginPath(); ctx.arc(0, 0, it.r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#ffd94d";
+  ctx.beginPath(); ctx.arc(0, 0, it.r * 0.72, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#a86e00";
+  ctx.font = "bold 64px 'DejaVu Sans', sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("$", 0, 4);
+  ctx.restore();
+}
+
+function drawBomb(it) {
+  ctx.save();
+  ctx.translate(it.x, it.y);
+  ctx.fillStyle = "#1c1c22";
+  ctx.beginPath(); ctx.arc(0, 0, it.r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "#3a3a44";
+  ctx.lineWidth = 6;
+  ctx.stroke();
+  // Sumbu + percikan.
+  ctx.strokeStyle = "#c9a227";
+  ctx.lineWidth = 7;
+  ctx.beginPath();
+  ctx.moveTo(0, -it.r + 6);
+  ctx.quadraticCurveTo(26, -it.r - 34, 48, -it.r - 22);
+  ctx.stroke();
+  const flick = 10 + Math.sin(elapsed * 22 + it.rot) * 5;
+  ctx.fillStyle = "#ffcf3d";
+  ctx.beginPath(); ctx.arc(50, -it.r - 24, flick, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#ff5a3c";
+  ctx.beginPath(); ctx.arc(50, -it.r - 24, flick * 0.55, 0, Math.PI * 2); ctx.fill();
+  // Tengkorak sederhana.
+  ctx.fillStyle = "#f2f2f2";
+  ctx.beginPath(); ctx.arc(-14, -8, 11, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(14, -8, 11, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(0, 2, 20, 0, Math.PI); ctx.fill();
+  ctx.fillRect(-20, 0, 40, 12);
+  ctx.fillStyle = "#1c1c22";
+  ctx.beginPath(); ctx.arc(-14, -8, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(14, -8, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawBasket() {
+  const x = basket.x, y = basket.y, w = basket.w, h = basket.h;
+  ctx.save();
+  ctx.translate(x, y);
+  // Badan keranjang.
+  const g = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+  g.addColorStop(0, "#8a5a2b");
+  g.addColorStop(1, "#5d3a17");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, -h / 2);
+  ctx.lineTo(w / 2, -h / 2);
+  ctx.lineTo(w / 2 - 26, h / 2);
+  ctx.lineTo(-w / 2 + 26, h / 2);
+  ctx.closePath();
+  ctx.fill();
+  // Anyaman.
+  ctx.strokeStyle = "rgba(255,220,150,0.55)";
+  ctx.lineWidth = 5;
+  for (let i = -1; i <= 1; i++) {
+    ctx.beginPath();
+    ctx.moveTo(i * 62 - 18, -h / 2 + 6);
+    ctx.lineTo(i * 62 - 8, h / 2 - 6);
+    ctx.stroke();
+  }
+  ctx.beginPath(); ctx.moveTo(-w / 2 + 8, 0); ctx.lineTo(w / 2 - 8, 0); ctx.stroke();
+  // Bibir keranjang.
+  ctx.fillStyle = "#a06a33";
+  ctx.fillRect(-w / 2 - 8, -h / 2 - 12, w + 16, 24);
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  // Skor besar.
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  ctx.fillRect(0, 0, W, 250);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 150px 'DejaVu Sans', sans-serif";
+  ctx.fillText(String(score), W / 2, 118);
+  ctx.fillStyle = "#ffd94d";
+  ctx.font = "bold 44px 'DejaVu Sans', sans-serif";
+  ctx.fillText("SKOR", W / 2, 210);
+  // Level + nyawa.
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#9fd8ff";
+  ctx.font = "bold 46px 'DejaVu Sans', sans-serif";
+  ctx.fillText("LEVEL " + level, 48, 330);
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#ff6b81";
+  let hearts = "";
+  for (let i = 0; i < 3; i++) hearts += i < lives ? "♥ " : "♡ ";
+  ctx.fillText(hearts, W - 48, 330);
+  ctx.textAlign = "center";
+}
+
+function drawOverlay() {
+  ctx.fillStyle = "rgba(5,8,20,0.72)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffd94d";
+  ctx.font = "bold 120px 'DejaVu Sans', sans-serif";
+  if (!started) {
+    ctx.fillText("COIN CATCH", W / 2, 760);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 52px 'DejaVu Sans', sans-serif";
+    ctx.fillText("Tangkap koin. Hindari bom.", W / 2, 900);
+    ctx.fillText("Makin cepat tiap 10 poin.", W / 2, 980);
+    ctx.fillStyle = "#9fd8ff";
+    ctx.font = "bold 56px 'DejaVu Sans', sans-serif";
+    ctx.fillText(DEMO ? "DEMO OTOMATIS" : "Klik / sentuh untuk mulai", W / 2, 1140);
+  } else if (over) {
+    ctx.fillText("GAME OVER", W / 2, 760);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 72px 'DejaVu Sans', sans-serif";
+    ctx.fillText("Skor: " + score + "   •   Level " + level, W / 2, 900);
+    ctx.fillStyle = "#9fd8ff";
+    ctx.font = "bold 52px 'DejaVu Sans', sans-serif";
+    ctx.fillText("Klik untuk main lagi", W / 2, 1060);
+  }
+  ctx.textAlign = "center";
+}
+
+function draw() {
+  drawBackground();
+  for (const it of items) {
+    if (it.kind === "coin") drawCoin(it); else drawBomb(it);
+  }
+  drawBasket();
+  drawHUD();
+  if (flash > 0) {
+    ctx.fillStyle = "rgba(255,40,60," + (flash * 0.28) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (!started || over) drawOverlay();
+}
+
+// ---- loop ----
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
